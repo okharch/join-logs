@@ -1,0 +1,27 @@
+input:
+  format: json
+  files:
+    - sender.log
+    - receiver.log
+output:
+  file: joined.log
+  fields:
+    - msg:
+        size: -80
+    - level:
+        filter: "level=$_"
+    - file:
+        filter: s{.*/odex/}{}
+include:
+    #file: m{broker/amqp/pub_sub.go|broker/handlers.go|actors/api/realtime.go|api/remote/exchange.go|ExMsg:|}
+exclude:
+    level: m{^trace$}
+color:
+  change_file: green
+  level:
+    info: blue
+    trace: yellow
+    error: "bold red"
+wait:
+    file: 10000
+    iteration: 100000
