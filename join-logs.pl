@@ -94,26 +94,8 @@ while (1) {
 	undef $joined;
 }
 
-# show_record decides whether to show record and if not, returns before the last line
-# last line outputs msg with %80s pad and then file and line where this msg was logged
-# 
-
-# filter out/ filter in record. 
-# returns the current position on file
-
-sub show_record {
-	my ($i) = @_;
-	# try to parse it with json 
-	my $rec = eval {$json->decode($_)};
-	if ($@) {
-		# try to parse it with name="value" or name=value format
-		my %rec = (m{(\S+)=(\S+)}g, m{(\S+)="(.*?[^\\])"}g);
-		return unless keys %rec; # neither format worked
-		$rec = \%rec;
-	}
-	my $level = $rec->{level};
-	return unless (include($rec));
-	return if exclude($rec);
+sub compose_output {
+	my $rec = shift;
 	my @out;
 	for my $field (@out_fields) {
 		my $name = $field->{name};
@@ -131,23 +113,50 @@ sub show_record {
 		warn "no field to output: $_";
 		return;
 	}
-	# if last_file changed, show new label along with time elapsed since last time file changed
-	if ($last_file != $i) {
-		$last_file = $i;
-		my $elapsed = (time - $last_time) * 1000; # milliseconds
-		$last_time = time;
-		my $file = $files[$i];
-		$prefix = $file_prefix[$i];
-		# shows time elapsed since last file label has been printed and new file label
-		local $_= sprintf("=== %5d ms %s %s\n", $elapsed, $file, show_time());
-		output_line($change_file_color);
-	}
     $_ = join("\t", @out)."\n";
+	return 1;
+}
+
+sub check_file_changed {
+	my $i = shift;
+	return if $last_file == $i;
+	# if last_file changed, show new label along with time elapsed since last time file changed
+	$last_file = $i;
+	my $elapsed = (time - $last_time) * 1000; # milliseconds
+	$last_time = time;
+	my $file = $files[$i];
+	$prefix = $file_prefix[$i];
+	# shows time elapsed since last file label has been printed and new file label
+	local $_= sprintf("=== %5d ms %s %s\n", $elapsed, $file, show_time());
+	output_line($change_file_color);
+}
+
+# show_record decides whether to show record and if not, returns before the last line
+# last line outputs msg with %80s pad and then file and line where this msg was logged
+# 
+
+# filter out/ filter in record. 
+sub show_record {
+	my ($i) = @_;
+	# try to parse it with json 
+	my $rec = eval {$json->decode($_)};
+	if ($@) {
+		# try to parse it with name="value" or name=value format
+		my %rec = (m{(\S+)=(\S+)}g, m{(\S+)="(.*?[^\\])"}g);
+		return unless keys %rec; # neither format worked
+		$rec = \%rec;
+	}
+	my $level = $rec->{level};
+	return unless (include($rec));
+	return unless compose_output($rec);
+	return if exclude($rec);
+	check_file_changed($i);
 	output_line($level_color->{$level},$prefix); # it outputs $_
 	return;
 }
 
 # show_records shows records one at the time from $last pos until eof
+# returns the current position on file
 sub show_records {
 	my ($i) = @_;
 	my $file = $files[$i];
@@ -162,7 +171,6 @@ sub show_records {
 # outputs $_ with specified color in terminal and makes copy to $joined file
 sub output_line {
 	my $color = shift || 'reset';
-	my $prefix = shift || '';
 	print color($color) unless $color eq $current_color;
 	$current_color = $color;
     print $prefix.$_; # terminal
