@@ -1,45 +1,58 @@
 #!/usr/bin/perl
+=pod
+
+This script:
+1. watches indefinitely log files like tail -f 
+2. joins record from them to stdout in convenient format
+3. colors different level of log messages to easily catch errors, etc.
+4. marks each line with tiny prefix for easily identifying of the source for that line
+
+You can:
+- extract values of fields from JSON output or from Field="Value" output 
+- use only some of fields to produce output
+- preprocess value of the field before including it to output
+- Decide whether to include/exclude particular line based on the value of fields
+
+All script configuration except of the set of the input files is configured by modifying source code.
+This allows script to keep singularity and to be easier to understand and more flexible in functionality
+
+=cut
+
 use strict;
 use warnings;
-use JSON; # it expects logs to be written in JSON format 
+use JSON;
 use Time::HiRes qw(time usleep gettimeofday);
 use Data::Dumper;
 use Term::ANSIColor;
-use YAML::Tiny;
-
-# config file is either argument of the script with the extension .yaml or name of the script minus .pl plus .yaml
-local $_ = $0;
-s/\.pl$//;
-my ($config_file) = grep m{\.yaml} && -f, @ARGV, "$_.yaml";
-die "don't know what output without config file!" unless -f $config_file;
-print STDERR "reading config file from:\t\t$config_file\n", ;
-my $config = YAML::Tiny::->read( $config_file )->[0] || {};
-#die Dumper($config);
 
 # interval in microseconds (10e-6 - one milllions of second)
-my $wait_file = get_config(qw(wait file)) || 10_000; # wait 0.01s before checking next file
-my $wait_iteration = get_config(qw(wait iteration)) || 100_000; # wait 0.1s before next iteration over files
+my $wait_file = 10_000; # wait 0.01s before checking next file
+my $wait_iteration = 100_000; # wait 0.1s before next iteration over files
 
 # outputs to terminal lines with corresponsding level in custom colors. default - reset
-my $level_color = get_config(qw(color level)) || {}; #'error' => 'bold red', 'trace' => 'yellow', 'info'=>'blue'}; 
+my $level_color = {'error' => 'bold red', 'trace' => 'yellow', 'info'=>'blue'}; 
 # color to output line about changing source lines of log 
-my $change_file_color = get_config(qw(color change_file)) || 'bold green'; 
+my $change_file_color = 'bold green'; 
 my $current_color = 'reset';
-
-# build check_conditions subs for include & exclude patterns
-my $include = build_check_conditions($config->{include},1);
-my $exclude = build_check_conditions($config->{exclude},0);
 
 my $json = JSON->new->allow_nonref(0);
 
-# this script watches indefinitely log files and joins record from them and outputs joined record in format nicely suited for debugging
-# this easy approach setups sender and receiver to output files in the current directory with those simple names.
-my (@files) = grep $_ ne $config_file, @ARGV;
+my $last_file = -1;
+my $last_time = time;
+my $prefix = '';
+
+# it gets the name of log files from script parameters. you can specify as many files as you want 
+my (@files) = @ARGV;
 @files = @{get_config(qw(input files)) || []} unless @files;
-printf STDERR "Collect joined logging from:\t\t%s\n", join(", ", @files);
+#my @pos = map -s || 0, @files; # memorize files end position at the current eof
+my @pos = map {0} @files; # memorize files end position at the current eof
+
+# for each of file it puts prefix in the beggining of the line so it is quickly identifiable which log file was the source of that particular line
+my @file_prefix = qw(< > 3: 4: 5: 6: 7:);
+printf STDERR "Collect joined logging from:\t\t%s\n", join(", ", map "$files[$_]($file_prefix[$_])", 0..$#files);
 
 # output file additional to terminal (stdout)
-my $joined_name = get_config(qw(output file)) || 'joined.log';
+my $joined_name = 'joined.log';
 print STDERR "Output joined log to:\t\t\t$joined_name\n";
 
 # it outputs joined log to $joined_name as well as colored joined output to terminal (see level_color)
@@ -47,25 +60,35 @@ unlink $joined_name;
 my $joined;
 
 # output fields
-my $out_fields = $config->{output}{fields};
+my @out_fields = (
+	{name => 'msg',		size	=> 	-80	}, 
+	{name => 'level',	filter	=>	sub {"level=$_"}}, 
+	{name => 'file',	filter 	=> 	sub {s{.*/odex/}{}}},
+);
 
+# which records to include in joined log
+sub include { 
+	my $rec = shift;
+	1; # include all so far
+}
 
-my @tag = map m{.*/(.*?)\..*}; # strips filename from path and extension
-my @pos = map -s || 0, @files; # memorize files end position 
-
-my $last_file = '';
-my $last_time = time;
+# which records to exclude from joined log
+sub exclude {
+	my $rec = shift;
+	return ($rec->{level} || '') eq 'trace';
+}
 
 # continue until ctrl-break
 while (1) {
 	usleep($wait_iteration);
-    # try to read records behind pos
+    # try to read records beyond pos
 	for my $i (0..$#files) {
 		usleep($wait_file); 
 		my $file = $files[$i];
 		my $size = -s $file || 0;
-		next unless $size > $pos[$i]+1;
-		$pos[$i] = show_records($file, $pos[$i]);
+		next unless $size > ($pos[$i]||0)+1;
+		# we found the size of file is beyond last pos of the file
+		$pos[$i] = show_records($i) || (-s $file);
 	}
 	close($joined) if $joined;
 	undef $joined;
@@ -77,120 +100,76 @@ while (1) {
 
 # filter out/ filter in record. 
 # returns the current position on file
+
 sub show_record {
-	my ($file,$last_pos) = @_;
-	# try to parse it with json
+	my ($i) = @_;
+	# try to parse it with json 
 	my $rec = eval {$json->decode($_)};
 	if ($@) {
-		#print "$file:$last_pos: JSON error $@\n"; # debug
-		# ignore any line if parser fails
-		return;
+		# try to parse it with name="value" or name=value format
+		my %rec = (m{(\S+)=(\S+)}g, m{(\S+)="(.*?[^\\])"}g);
+		return unless keys %rec; # neither format worked
+		$rec = \%rec;
 	}
 	my $level = $rec->{level};
-	unless ($include->($rec)) {
-		#print "$file:$last_pos: not included\n"; # debug
-		return;
-	}
-	if (my $field_cond = $exclude->($rec)) {
-		#print "$file:$last_pos: excluded: $field_cond\n"; # debug
-		return;
-	}
-	#print "$file:$last_pos: create output\n"; # debug
+	return unless (include($rec));
+	return if exclude($rec);
 	my @out;
-	for (@$out_fields) {
-		$_ = {$_=>{}} unless ref($_) eq 'HASH';
-		my ($name) = keys %$_;
-		my ($params) = $_->{$name};
+	for my $field (@out_fields) {
+		my $name = $field->{name};
 		# value of the field
 		local $_ = $rec->{$name};
 		# apply filter
-		my $filter = $params->{filter};
-		eval $filter if $filter;
+		my $filter = $level_color->{filter};
+		$filter->() if $filter;
 		# apply size
-		my $size = $params->{size};
+		my $size = $field->{size};
 		$_ = sprintf("%${size}s", $_) if $size;
 		push @out, $_;
 	}
-	die "no field to output!" unless @out;
+	unless (@out) {
+		warn "no field to output: $_";
+		return;
+	}
 	# if last_file changed, show new label along with time elapsed since last time file changed
-	if ($last_file ne $file) {
-		$last_file = $file;
+	if ($last_file != $i) {
+		$last_file = $i;
 		my $elapsed = (time - $last_time) * 1000; # milliseconds
 		$last_time = time;
+		my $file = $files[$i];
+		$prefix = $file_prefix[$i];
 		# shows time elapsed since last file label has been printed and new file label
 		local $_= sprintf("=== %5d ms %s %s\n", $elapsed, $file, show_time());
 		output_line($change_file_color);
 	}
     $_ = join("\t", @out)."\n";
-	output_line($level_color->{$level}); # it outputs $_
+	output_line($level_color->{$level},$prefix); # it outputs $_
 	return;
 }
 
 # show_records shows records one at the time from $last pos until eof
 sub show_records {
-	my ($file,$last_pos) = @_;
+	my ($i) = @_;
+	my $file = $files[$i];
+	my $last_pos = $pos[$i];
 	# read one line	
 	open my $fh, "<", $file;
 	seek $fh, $last_pos, 0;
-	while (<$fh>) { show_record($file,$last_pos) }
+	while (<$fh>) { show_record($i) }
 	return tell $fh;
 }
 
 # outputs $_ with specified color in terminal and makes copy to $joined file
 sub output_line {
 	my $color = shift || 'reset';
+	my $prefix = shift || '';
 	print color($color) unless $color eq $current_color;
 	$current_color = $color;
-    print $_; # terminal
+    print $prefix.$_; # terminal
 	unless ($joined) {
 		open $joined, ">>", $joined_name || die "can't open $joined_name for output";
 	}
-	print $joined $_; # file
-}
-
-# build_check_conditions builds subroutine which checks whether current line is to be included/excluded to output
-# $conditions contains include/exclude conditions for each field.
-# $no_conditions = 1 for include and 0 for exclude (that means if sub will return true if there is no any conditions for include and false for exclude)
-sub build_check_conditions {
-	my ($conditions,$no_conditions) = @_;
-	return sub { $no_conditions } unless $conditions;
-	my @fields = keys %$conditions;
-	# unify type of $conditions
-	for my $field (@fields) {
-		my $checks = $conditions->{$field };
-		$checks = [$checks] unless ref($checks);
-		for (@$checks) {
-			my $condition = $_;
-			$_ = eval "sub {return $_?qq{$field}:0;}";
-			die "failed to compile condition $condition for field $field : $@" if $@;
-		}			
-		$conditions->{$field} = $checks
-	}
-	return sub {
-		my $rec = shift;
-		for my $field (@fields) {
-			local $_ = $rec->{$field}; # value of filed
-			my $conditions = $conditions->{$field};
-			for my $condition (@$conditions) {
-				# check value of field against the condition
-				return "$field:$_" if $condition->();
-			}
-		}
-		0; # no condition has been met
-	}
-}
-
-# get_config returns value of nested key, 
-# e.g. get_config(qw(f1 f2 f3)) equal to $config->{f1}{f2}{f3}
-# it returns undef if nested key does not exist
-sub get_config {
-	my @fields = @_;
-	my $result = $config;
-	for (@_) {
-		return unless ref($result) eq 'HASH';
-		$result = $result->{$_};
-	}
-	return $result;
+	print $joined $prefix.$_; # file
 }
 
 sub show_time {
